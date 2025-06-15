@@ -4,6 +4,7 @@ import time
 import numpy as np
 from scipy.linalg import solve_continuous_are
 import math
+from control import lqr
 import matplotlib.pyplot as plt
 
 # --- System Parameters ---
@@ -11,66 +12,44 @@ m = 5.0       # Mass of the payload (kg)
 l = 2.0       # Length of the link (m)
 g = 3.71      # Mars gravity (m/s²) i belive that i am on the Mars
 
+# ẋ = Ax + Bu
+# ẋ = Ax + B(-Kx) = (A - BK)x
+# Цель: чтобы матрица (A - BK) имела устойчивые (отрицательные) собственные значения
+
 # Moment of inertia about the rotation axis
 I = m * l**2
-
-# --- LQR Calculation ---
-# System matrices (linearized around upright position)
-# State: [angle, angular velocity]
 A = np.array([
     [0, 1],
-    [m*g*l/I, 0]  # Restoring force coefficient
+    [m*g*l/I, 0]
 ])
-
-# Control matrix (torque)
 B = np.array([[0], [1/I]])
+Q = np.diag([10, 1])
+R = np.array([[0.1]])
 
-# Weight matrices
-Q = np.diag([10, 1])  # State weights: angle and angular velocity
-R = np.array([[0.1]])  # Control weight
-
-# Solve Riccati equation
-P = solve_continuous_are(A, B, Q, R)
-
-# Calculate LQR gain matrix
-K = np.linalg.inv(R) @ B.T @ P
+K_lqr, _, _ = lqr(A, B, Q, R)
+K = -K_lqr  #A-BK
 
 print("LQR Gain Matrix:", K)
 
-# --- PyBullet Initialization ---
+# --- PyBullet Simulation ---
 physicsClient = p.connect(p.GUI)
 p.setAdditionalSearchPath(pybullet_data.getDataPath())
 p.setGravity(0, 0, -g)
 planeId = p.loadURDF("plane.urdf")
-
-# Load the two-link pendulum from external URDF
 robot = p.loadURDF("two-link.urdf", basePosition=[0, 0, 0])
 
-# Find joint index
-joint_index = None
-for i in range(p.getNumJoints(robot)):
-    joint_info = p.getJointInfo(robot, i)
-    if joint_info[1].decode("utf-8") == "joint_1":
-        joint_index = i
-        break
-
+# Find joint
+joint_index = next((i for i in range(p.getNumJoints(robot))
+                    if p.getJointInfo(robot, i)[1].decode() == "joint_1"), None)
 if joint_index is None:
-    raise ValueError("Joint 'joint_1' not found in the URDF file")
+    raise ValueError("Joint 'joint_1' not found")
 
-# Disable default motor controller
-p.setJointMotorControl2(
-    robot, 
-    joint_index,
-    p.VELOCITY_CONTROL,
-    force=0
-)
+p.setJointMotorControl2(robot, joint_index, p.VELOCITY_CONTROL, force=0)
 
-# Simulation parameters
-dt = 1.0 / 240.0  # Simulation timestep
-sim_time = 10.0    # Total simulation time in seconds
-
-# Initial state: slight offset from vertical
-initial_angle = 0.1  # radians (~5.7 degrees)
+# Simulation setup
+dt = 1.0 / 240.0
+sim_time = 5.0
+initial_angle = np.pi + 0.5
 p.resetJointState(robot, joint_index, targetValue=initial_angle)
 
 # Data logging
@@ -78,61 +57,79 @@ log_time = []
 log_angle = []
 log_control = []
 
-# Main simulation loop
+# Stability detection
+stabilization_time = None
+STABILITY_THRESHOLD = 0.02  # rad
+STABILITY_DURATION = 1.0  # sec
+
+# Main loop
 start_time = time.time()
 current_time = 0.0
+stable_start = None
 
 while current_time < sim_time:
-    # Get current state
-    joint_state = p.getJointState(robot, joint_index)
-    angle = joint_state[0]  # Current angle
-    angle_vel = joint_state[1]  # Angular velocity
-    
-    # State vector (deviation from vertical)
+    # Get state
+    angle, angle_vel = p.getJointState(robot, joint_index)[:2]
     angle_error = angle - math.pi
-    
+
+    # Check stability
+    if abs(angle_error) < STABILITY_THRESHOLD:
+        if stable_start is None:
+            stable_start = current_time
+        elif current_time - stable_start >= STABILITY_DURATION and stabilization_time is None:
+            stabilization_time = current_time
+    else:
+        stable_start = None
+
+    # Control
     state = np.array([[angle_error], [angle_vel]])
-    
-    # Calculate control input
-    control = -K @ state
-    torque = control[0, 0]
-    
-    # Apply torque to joint
-    p.setJointMotorControl2(
-        robot,
-        joint_index,
-        p.TORQUE_CONTROL,
-        force=torque
-    )
-    
+    torque = (K @ state)[0, 0]
+    p.setJointMotorControl2(robot, joint_index, p.TORQUE_CONTROL, force=torque)
+
     # Simulation step
     p.stepSimulation()
-    
-    # Log data
+
+    # Logging
     log_time.append(current_time)
-    log_angle.append(angle_error)
+    log_angle.append(angle)
     log_control.append(torque)
-    
-    # Real-time synchronization
+
     time.sleep(dt)
     current_time = time.time() - start_time
 
 p.disconnect()
 
-# Visualization
-plt.figure(figsize=(12, 6))
-plt.subplot(2, 1, 1)
-plt.plot(log_time, log_angle)
-plt.title('Angle Deviation from Vertical (Mars Gravity)')
-plt.ylabel('Angle (rad)')
-plt.grid(True)
+plt.figure(figsize=(14, 8))
 
+# Angle plot with improved stabilization marker
+plt.subplot(2, 1, 1)
+plt.plot(log_time, log_angle, label='Actual Angle', linewidth=2)
+plt.axhline(y=np.pi, color='r', linestyle='--', label='Target (π)')
+
+# Only draw stabilization line if truly stabilized
+if stabilization_time and stabilization_time < log_time[-1] - 1.0:
+    plt.axvline(x=stabilization_time, color='g', linestyle='-',
+               linewidth=2, alpha=0.7, label=f'Stabilization ({stabilization_time:.2f}s)')
+    plt.axvspan(stabilization_time, log_time[-1], color='g', alpha=0.05)
+
+plt.title('Pendulum Angle Stabilization on Mars', fontsize=14)
+plt.ylabel('Angle [rad]', fontsize=12)
+plt.legend(fontsize=10, loc='upper right')
+plt.grid(True, linestyle=':', alpha=0.7)
+plt.ylim(min(log_angle)-0.1, max(log_angle)+0.1)
+
+# Control torque plot
 plt.subplot(2, 1, 2)
-plt.plot(log_time, log_control)
-plt.title('Control Torque')
-plt.xlabel('Time (s)')
-plt.ylabel('Torque (N·m)')
-plt.grid(True)
+plt.plot(log_time, log_control, label='Control Torque', color='purple', linewidth=2)
+if stabilization_time and stabilization_time < log_time[-1] - 1.0:
+    plt.axvline(x=stabilization_time, color='g', linestyle='-', linewidth=2, alpha=0.7)
+    plt.axvspan(stabilization_time, log_time[-1], color='g', alpha=0.05)
+
+plt.title('Control Torque', fontsize=14)
+plt.xlabel('Time [s]', fontsize=12)
+plt.ylabel('Torque [Nm]', fontsize=12)
+plt.legend(fontsize=10)
+plt.grid(True, linestyle=':', alpha=0.7)
 
 plt.tight_layout()
 plt.show()
